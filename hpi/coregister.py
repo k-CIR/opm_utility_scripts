@@ -30,6 +30,7 @@ import mne
 import numpy as np
 from ..viz import plot_hpi_alignment
 from ._core import fit_hpi, apply_transform, save_raw
+from ._legacy import fit_hpi_legacy
 
 
 # ---------------------------------------------------------------------------
@@ -120,10 +121,10 @@ def _prompt_yes_no(prompt, default=False):
         print("  Please enter 'y' or 'n'.")
 
 
-def _output_suffix(datfile: str, new_sfreq: float) -> str:
+def _output_suffix(datfile: str, new_sfreq: float, engine='current') -> str:
     """Return the output suffix, including '+ds' only when the file is resampled."""
     info = mne.io.read_info(datfile, verbose='error')
-    suffix = '_proc-hpi'
+    suffix = '_proc-hpi-legacy' if engine == 'legacy' else '_proc-hpi'
     if int(new_sfreq) != int(info['sfreq']):
         suffix += '+ds'
     return suffix + '_raw.fif'
@@ -147,7 +148,7 @@ def _parse_args():
     )
     p.add_argument(
         '--pol', '-p', metavar='FILE',
-        help='Polhemus digitisation file (.json or .fif).',
+        help='Polhemus digitisation file (.json or .fif current; head-frame FIF required for --legacy).',
     )
     p.add_argument(
         '--reffile', '-r', metavar='FILE', default=None,
@@ -160,10 +161,13 @@ def _parse_args():
         help='HPI drive frequency in Hz (default: ask).',
     )
     p.add_argument(
-        '--gof', type=float, default=0.95, metavar='THRESH',
+        '--gof', type=float, default=None, metavar='THRESH',
         help='Minimum dipole GOF for a coil to be included in the '
-             'device-to-head transform fit (default: 0.95).',
+             'device-to-head transform fit (default: 0.95 current, 0.9 legacy).',
     )
+    p.add_argument('--legacy', action='store_true',
+                   help='Use the opt-in legacy numerical engine (head-frame FIF only); '
+                        'outputs have a distinct -legacy suffix.')
     p.add_argument(
         '--no-center-matching', dest='center_matching',
         action='store_false', default=True,
@@ -174,11 +178,12 @@ def _parse_args():
              'testing / legacy-parity comparisons, not routine use.',
     )
     p.add_argument(
-        '--optimization', choices=['none', 'rigid'], default='rigid', metavar='METHOD',
+        '--optimization', choices=['none', 'rigid'], default=None, metavar='METHOD',
         help='Optimization method applied after the initial HPI→Polhemus '
              'coregistration. "none": no refinement. "rigid": '
-             'refine with rigid transform of polhemus locations by '
-             'minimizing the summed dipole RV (default).',
+              'refine with rigid transform of polhemus locations by '
+              'minimizing summed dipole RV (default current; legacy always uses '
+              'closed-form rigid point matching without GOF refinement).',
     )
     p.add_argument(
         '--sfreq', '-s', type=float, default=None, metavar='HZ',
@@ -202,6 +207,11 @@ def _parse_args():
 def main():
     args = _parse_args()
 
+    if args.legacy and args.optimization == 'rigid':
+        raise ValueError('--optimization rigid is not supported by the legacy engine; legacy uses closed-form rigid matching.')
+    if args.legacy and args.reffile:
+        raise ValueError('--reffile noise-channel detection is not implemented by the legacy engine.')
+
     # ----------------------------------------------------------------
     # Resolve inputs — CLI args take priority; fall back to interactive
     # command-line prompts for anything not supplied.
@@ -216,7 +226,7 @@ def main():
     # Reference file is genuinely optional — only asked interactively (with
     # a blank-to-skip option), never forced.
     reffile = args.reffile
-    if reffile is None and need_prompts:
+    if reffile is None and need_prompts and not args.legacy:
         reffile = _prompt_path(
             "Reference file for noisy-channel detection",
             extensions=('.fif',), allow_blank=True,
@@ -252,9 +262,13 @@ def main():
     print(f"Polhemus:     {polfile}")
     print(f"Reference:    {reffile if reffile else '(none — skipping noisy channel detection)'}")
     print(f"Frequency:    {hpifreq} Hz")
-    print(f"GOF limit:    {args.gof}")
-    print(f"Matching:     {'centred' if args.center_matching else 'uncentred (legacy)'}")
-    print(f"Optimization: {args.optimization}")
+    gof_limit = args.gof if args.gof is not None else (.9 if args.legacy else .95)
+    optimization = args.optimization or ('none' if args.legacy else 'rigid')
+    print(f"Engine:       {'legacy' if args.legacy else 'current'}")
+    print(f"GOF limit:    {gof_limit}")
+    matching = 'uncentred (legacy)' if args.legacy else ('centred' if args.center_matching else 'uncentred')
+    print(f"Matching:     {matching}")
+    print(f"Optimization: {optimization}")
     print(f"Target sfreq: {new_sfreq} Hz")
     print(f"Save:         {doSave}{'  (overwrite)' if overwrite else ''}")
     print(f"Plot:         {plotResult}")
@@ -262,8 +276,14 @@ def main():
     # ----------------------------------------------------------------
     # Fit HPI coils (shared across all data files)
     # ----------------------------------------------------------------
-    fit = fit_hpi(hpifile, polfile, hpifreq, gof_limit=args.gof, reffile=reffile,
-                  center_matching=args.center_matching, optim=args.optimization)
+    if args.legacy:
+        fit = fit_hpi_legacy(hpifile, polfile, hpifreq, new_sfreq=new_sfreq,
+                             gof_limit=gof_limit,
+                             strict_legacy_gof=args.gof is None)
+    else:
+        fit = fit_hpi(hpifile, polfile, hpifreq, gof_limit=gof_limit, reffile=reffile,
+                      center_matching=args.center_matching,
+                      optim=optimization)
 
     hpi_names       = fit['hpi_names']
     hpi_dev         = fit['hpi_dev']
@@ -296,7 +316,7 @@ def main():
     print(f"hpi_dev  (device frame, mm):\n{np.round(hpi_dev * 1000, 1)}\n")
     print(f"mean distance = {np.mean(dist) * 1000:.1f} mm\n")
     for index, value in enumerate(hpi_gofs):
-        status = 'ok' if value > 0.9 else 'not ok'
+        status = 'ok' if fit['include_hpis'][index] else 'not ok'
         print(f"Coil: {hpi_names[index][-3:]}, GOF: {value:.3f}, Status: {status}")
     print('---------------------------------------------')
 
@@ -308,7 +328,7 @@ def main():
     last_raw_out = None
 
     for datfile in datafiles:
-        suffix  = _output_suffix(datfile, new_sfreq)
+        suffix  = _output_suffix(datfile, new_sfreq, engine=fit.get('engine', 'current'))
         raw_out = apply_transform(datfile, fit, new_sfreq)
 
         if doSave:

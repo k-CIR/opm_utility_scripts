@@ -27,6 +27,7 @@ from mne.chpi import compute_chpi_locs
 from mne.io.constants import FIFF
 from mne.transforms import apply_trans, Transform
 from ._core import fit_hpi_amplitudes, fit_hpi, compute_fit_diagnostics
+from ._legacy import fit_hpi_legacy
 from ..viz import plot_hpi_raw_channels
 
 # ---------------------------------------------------------------------------
@@ -45,8 +46,8 @@ _MIN_COILS      = 3     # minimum coils that must pass _GOF_ACCEPT to accept the
                         # fit — e.g. 3 of 4 coils with GOF ≥ 0.98 is accepted
 
 
-def _gof_color(g):
-    if g >= _GOF_ACCEPT:
+def _gof_color(g, gof_accept=_GOF_ACCEPT):
+    if g >= gof_accept:
         return 'green'
     elif g >= 0.8:
         return 'darkorange'
@@ -54,7 +55,9 @@ def _gof_color(g):
 
 
 def _recommendation(hpi_gofs, dists_mm=None, include_hpis=None,
-                    pol_gofs=None, hpi_names=None):
+                    pol_gofs=None, hpi_names=None,
+                    gof_accept=_GOF_ACCEPT, pol_gof_accept=_POL_GOF_ACCEPT,
+                    gof_inclusive=True):
     """Evaluate HPI fit quality and return separate verdicts for each failure mode.
 
     There are two independent causes of a poor HPI result:
@@ -116,26 +119,27 @@ def _recommendation(hpi_gofs, dists_mm=None, include_hpis=None,
     # ------------------------------------------------------------------ #
     hpi_reasons = []
 
-    poor_gof = hpi_gofs < _GOF_ACCEPT
+    poor_gof = hpi_gofs < gof_accept if gof_inclusive else hpi_gofs <= gof_accept
+    comparator = '≥' if gof_inclusive else '>'
 
     if include_hpis is not None:
         n_good = int(np.sum(include_hpis))
     else:
-        n_good = int(np.sum(hpi_gofs >= _GOF_ACCEPT))
+        n_good = int(np.sum(hpi_gofs >= gof_accept))
 
     if poor_gof.any():
         hpi_reasons.append(
-            f'{poor_gof.sum()} coil(s) have GOF < {_GOF_ACCEPT} '
+            f'{poor_gof.sum()} coil(s) have GOF {"<" if gof_inclusive else "≤"} {gof_accept} '
             f'— dipole model does not fit the MEG data well'
         )
 
     if n_good >= _MIN_COILS:
         hpi_verdict, hpi_color = 'OK', 'green'
         if not hpi_reasons:
-            hpi_reasons = [f'All coils GOF ≥ {_GOF_ACCEPT} — HPI recording is good']
+            hpi_reasons = [f'All coils GOF {comparator} {gof_accept} — HPI recording is good']
         else:
             hpi_reasons.append(
-                f'→ {n_good} coil(s) GOF ≥ {_GOF_ACCEPT} (need ≥ {_MIN_COILS}) — accepted'
+                f'→ {n_good} coil(s) GOF {comparator} {gof_accept} (need ≥ {_MIN_COILS}) — accepted'
             )
     else:
         hpi_verdict, hpi_color = 'POOR', 'red'
@@ -167,11 +171,12 @@ def _recommendation(hpi_gofs, dists_mm=None, include_hpis=None,
     if pol_gofs is not None and len(pol_gofs):
         pol_gofs   = np.asarray(pol_gofs)
         finite     = np.isfinite(pol_gofs)
-        poor_pgof  = finite & (pol_gofs < _POL_GOF_ACCEPT)
-        n_good_pol = int(np.sum(finite & (pol_gofs >= _POL_GOF_ACCEPT)))
+        poor_pgof  = finite & (pol_gofs < pol_gof_accept)
+        n_good_pol = (int(np.sum(finite & (pol_gofs >= pol_gof_accept)))
+                      if finite.any() else None)
         if poor_pgof.any():
             pol_reasons.append(
-                f'{poor_pgof.sum()} coil(s) have polhemus-position GOF < {_POL_GOF_ACCEPT} '
+                f'{poor_pgof.sum()} coil(s) have polhemus-position GOF < {pol_gof_accept} '
                 f'— digitised position does not match the MEG field pattern'
             )
 
@@ -187,10 +192,12 @@ def _recommendation(hpi_gofs, dists_mm=None, include_hpis=None,
 
     if not pol_reasons:
         pol_verdict, pol_color = 'OK', 'green'
-        pol_reasons = [
-            f'All polhemus-position GOFs ≥ {_POL_GOF_ACCEPT} and '
-            f'residuals < {_DIST_ACCEPT:.0f} mm — polhemus registration is good'
-        ]
+        if n_good_pol is None:
+            pol_reasons = [f'Residuals < {_DIST_ACCEPT:.0f} mm; no fixed-position '
+                           'Polhemus GOF is available for this engine']
+        else:
+            pol_reasons = [f'All polhemus-position GOFs ≥ {pol_gof_accept} and '
+                           f'residuals < {_DIST_ACCEPT:.0f} mm — polhemus registration is good']
     elif (
         n_good_dist >= _MIN_COILS
         and (n_good_pol is None or n_good_pol >= _MIN_COILS)
@@ -211,7 +218,7 @@ def _recommendation(hpi_gofs, dists_mm=None, include_hpis=None,
         )
         if n_good_pol is not None:
             pol_reasons.append(
-                f'→ {n_good_pol} coil(s) polhemus-position GOF ≥ {_POL_GOF_ACCEPT} '
+                f'→ {n_good_pol} coil(s) polhemus-position GOF ≥ {pol_gof_accept} '
                 f'(need ≥ {_MIN_COILS}) — accepted'
             )
     elif mean_res >= _DIST_ACCEPT * 2 or (
@@ -381,22 +388,25 @@ def _parse_args():
                         help='Optional reference recording (e.g. resting '
                              'state) used for background-power-based noisy '
                              'channel detection (default: skip this step).')
-    parser.add_argument('--gof', type=float, default=0.95, metavar='THRESH',
+    parser.add_argument('--gof', type=float, default=None, metavar='THRESH',
                         help=(
                             'Minimum dipole GOF for a coil to be included in the '
-                            'device-to-head transform fit (default: 0.95).'
+                            'device-to-head transform fit (default: 0.95 current, 0.9 legacy).'
                         ))
+    parser.add_argument('--legacy', action='store_true',
+                        help='Use the opt-in legacy numerical engine; requires both --hpi and head-frame FIF --pol.')
     parser.add_argument('--detailed', action='store_true',
                         help='Show full diagnostics in --hpi + --pol mode '
                              '(sensor count, inter-coil distance table, pol-GOFs).')
     parser.add_argument('--optimization', choices=['none', 'rigid'],
-                        default='rigid',metavar='METHOD',
+                        default=None,metavar='METHOD',
                         help=(
                             'Optimization method applied after the initial HPI→Polhemus '
                             'coregistration. '
                             '"none": no refinement. '
                             '"rigid": refine with rigid transform of polhemus '
-                            'locations by minimizing the summed dipole RV (default).'
+                            'locations by minimizing summed dipole RV (default current; '
+                            'not available with --legacy).'
                         ))
     parser.add_argument('--no-center-matching', dest='center_matching',
                         action='store_false', default=True,
@@ -651,6 +661,7 @@ def _build_figure_full(fit, detailed=False, diag=None):
     include_hpis = np.array(fit['include_hpis'])
     tree_indices = np.array(fit['tree_indices'])
     raw          = fit['raw_for_topomap']
+    gof_accept   = fit.get('gof_limit', _GOF_ACCEPT)
 
     hpi_fitted_head_mm = apply_trans(dev_to_head, hpi_dev) * 1000
     hpi_pol_mm         = hpi_orig * 1000
@@ -695,7 +706,7 @@ def _build_figure_full(fit, detailed=False, diag=None):
 
     # Fitted coil positions — colour-coded by GOF
     for i, (pos, gof) in enumerate(zip(hpi_fitted_head_mm, hpi_gofs)):
-        color = _gof_color(gof)
+        color = _gof_color(gof, gof_accept)
         ax_3d.scatter(*pos, c=color, s=80, marker='o', zorder=7, depthshade=False)
         short = _short_name(hpi_names[i])
         ax_3d.text(pos[0], pos[1], pos[2],
@@ -751,6 +762,7 @@ def _fill_text_panel_full(ax, fit, detailed=False, diag=None):
     hpi_names    = fit['hpi_names']
     include_hpis = np.array(fit['include_hpis'])
     dists_mm     = np.array(fit['dist']) * 1000
+    gof_accept   = fit.get('gof_limit', _GOF_ACCEPT)
 
     if diag is None:
         diag = compute_fit_diagnostics(fit)
@@ -771,10 +783,11 @@ def _fill_text_panel_full(ax, fit, detailed=False, diag=None):
 
     add('Per-coil GOF:', 'black')
     for name, gof in zip(hpi_names, hpi_gofs):
-        add(f'  {name}: {gof:.3f}', _gof_color(gof))
+        add(f'  {name}: {gof:.3f}', _gof_color(gof, gof_accept))
 
     pol_gofs_fig = np.asarray(fit.get('pol_gofs', []))
-    has_pgof_fig = len(pol_gofs_fig) == len(np.where(include_hpis)[0])
+    has_pgof_fig = (len(pol_gofs_fig) == len(np.where(include_hpis)[0])
+                    and np.isfinite(pol_gofs_fig).any())
 
     add('─' * 40, '#888888')
     add('Residuals (fitted vs Polhemus):', 'black')
@@ -786,7 +799,8 @@ def _fill_text_panel_full(ax, fit, detailed=False, diag=None):
         add(f'  {short}: {d:.2f} mm{pgof_str}', color)
     for dev_i in np.where(~include_hpis)[0]:
         short = _short_name(hpi_names[dev_i])
-        add(f'  {short}: excl. (GOF<{_GOF_ACCEPT})', 'gray')
+        op = '≥' if fit.get('gof_inclusive', True) else '>'
+        add(f'  {short}: excl. (GOF {op} {gof_accept} required)', 'gray')
 
     add('─' * 40, '#888888')
     add(f'Mean residual: {diag["mean_res_mm"]:.2f} mm',
@@ -809,12 +823,14 @@ def _fill_text_panel_full(ax, fit, detailed=False, diag=None):
             add(f'  {si}-{sj:<10} {da:7.1f} {db:7.1f} {diff:7.1f}', col)
 
     pol_gofs     = np.asarray(fit.get('pol_gofs', []))
-    has_pol_gofs = len(pol_gofs) == len(np.where(include_hpis)[0])
+    has_pol_gofs = (len(pol_gofs) == len(np.where(include_hpis)[0])
+                    and np.isfinite(pol_gofs).any())
 
     hpi_v, hpi_c, hpi_r, pol_v, pol_c, pol_r = _recommendation(
         hpi_gofs, dists_mm, include_hpis,
         pol_gofs if has_pol_gofs else None,
-        hpi_names=hpi_names,
+        hpi_names=hpi_names, gof_accept=gof_accept,
+        gof_inclusive=fit.get('gof_inclusive', True),
     )
     add('─' * 40, '#888888')
     add(f'HPI recording: {hpi_v}', hpi_c)
@@ -835,6 +851,7 @@ def _print_diagnostics_full(fit, detailed=False, diag=None):
     dists_mm     = np.array(fit['dist']) * 1000
     pol_gofs     = np.array(fit.get('pol_gofs', []))
     has_pol_gofs = len(pol_gofs) == len(np.where(include_hpis)[0])
+    gof_accept = fit.get('gof_limit', _GOF_ACCEPT)
 
     # All derived scalars and inter-coil data from the single authoritative source.
     if diag is None:
@@ -855,7 +872,7 @@ def _print_diagnostics_full(fit, detailed=False, diag=None):
     print(f'  {"Coil":<28} {"GOF":>6}')
     print('  ' + '─' * 36)
     for name, gof in zip(hpi_names, hpi_gofs):
-        flag = 'OK' if gof >= _GOF_ACCEPT else ('MARGINAL' if gof >= 0.8 else 'POOR')
+        flag = 'OK' if gof >= gof_accept else ('MARGINAL' if gof >= 0.8 else 'POOR')
         print(f'  {name:<28} {gof:6.3f}  [{flag}]')
 
     # Always: residuals
@@ -867,7 +884,8 @@ def _print_diagnostics_full(fit, detailed=False, diag=None):
         print(f'  {hpi_names[dev_i]}: {d:.2f} mm  [{flag}]{pgof_str}')
     for dev_i in np.where(~include_hpis)[0]:
         g = hpi_gofs[dev_i]
-        print(f'  {hpi_names[dev_i]}: excluded (GOF = {g:.3f} < {_GOF_ACCEPT})')
+        op = '≥' if fit.get('gof_inclusive', True) else '>'
+        print(f'  {hpi_names[dev_i]}: excluded (GOF = {g:.3f}; requires GOF {op} {gof_accept})')
 
     print(f'\n  Mean residual: {diag["mean_res_mm"]:.2f} mm')
     print(f'  Transform: rotation {diag["rot_deg"]:.1f}°, translation {diag["trans_mm"]:.1f} mm')
@@ -887,7 +905,8 @@ def _print_diagnostics_full(fit, detailed=False, diag=None):
     hpi_v, _, hpi_r, pol_v, _, pol_r = _recommendation(
         hpi_gofs, dists_mm, include_hpis,
         pol_gofs if len(pol_gofs) else None,
-        hpi_names=hpi_names,
+        hpi_names=hpi_names, gof_accept=gof_accept,
+        gof_inclusive=fit.get('gof_inclusive', True),
     )
     _sep(f'HPI recording: {hpi_v}')
     for r in hpi_r:
@@ -908,6 +927,7 @@ def main():
 
     hpi_file = args.hpi or None
     pol_file = args.pol or None
+    gof_limit = args.gof if args.gof is not None else (.9 if args.legacy else .95)
 
     # ------------------------------------------------------------------ #
     # Mode dispatch                                                        #
@@ -934,12 +954,25 @@ def main():
             print('No file provided. Exiting.')
             sys.exit(0)
 
+    if args.legacy and not (hpi_file and pol_file):
+        print('[ERROR] --legacy requires both --hpi and --pol.', file=sys.stderr)
+        sys.exit(2)
+
     if hpi_file and pol_file:
         # Full coregistration
         try:
-            fit = fit_hpi(hpi_file, pol_file, args.freq, gof_limit=args.gof,
-                          optim=args.optimization, reffile=args.reffile,
-                          center_matching=args.center_matching)
+            if args.legacy:
+                if args.reffile:
+                    raise ValueError('--reffile noise-channel detection is not implemented by the legacy engine.')
+                if args.optimization is not None:
+                    raise ValueError('--optimization is not applicable with --legacy; legacy uses rigid least squares only.')
+                fit = fit_hpi_legacy(hpi_file, pol_file, args.freq,
+                                     gof_limit=gof_limit,
+                                     strict_legacy_gof=args.gof is None)
+            else:
+                fit = fit_hpi(hpi_file, pol_file, args.freq, gof_limit=gof_limit,
+                              optim=args.optimization or 'rigid', reffile=args.reffile,
+                              center_matching=args.center_matching)
             diag = compute_fit_diagnostics(fit)
             _print_diagnostics_full(fit, detailed=detailed, diag=diag)
             _build_figure_full(fit, detailed=detailed, diag=diag)
